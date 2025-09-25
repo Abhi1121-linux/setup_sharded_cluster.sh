@@ -1,0 +1,515 @@
+set -euo pipefail
+
+#!/bin/bash → tells the system to use bash shell to run this script.
+
+
+set -euo pipefail → makes the script safer:
+
+
+-e → exit immediately if a command fails.
+
+
+-u → exit if you use an undefined variable.
+
+
+-o pipefail → makes pipelines fail if any command fails, not just the last one.
+
+
+3. User-configurable variables
+
+IP="localhost"
+BASE_PATH="${HOME}/mongodb_cluster"
+CONFIG_PORT=27021
+MONGOS_PORT=27017
+
+IP="localhost" → cluster runs only locally.
+
+
+BASE_PATH → directory where all MongoDB data and logs are stored.
+
+
+CONFIG_PORT=27021 → port for the Config Server.
+
+
+MONGOS_PORT=27017 → port for the mongos router (the entry point).
+
+
+4. Shard definitions
+declare -A SHARDS
+SHARDS=( ["shard1"]=27018 ["shard2"]=27019 ["shard3"]=27020 )
+
+This creates an associative array in bash:
+Key = shard name (shard1, shard2, shard3).
+
+
+Value = port where each shard will run (27018, 27019, 27020).
+
+
+5. Tool check
+
+for TOOL in mongod mongos mongosh; do
+	if ! command -v "${TOOL}" >/dev/null 2>&1; then
+		echo "ERROR: ${TOOL} not found in PATH. Install MongoDB tools and retry." >&2
+		exit 1
+	fi
+done
+
+
+Loops over mongod, mongos, and mongosh.
+
+
+command -v checks if tool is available.
+
+
+If missing → error and exit.
+ ✅ This prevents half-broken setups.
+
+
+6. Creating directories
+
+echo "📂 Creating directories under ${BASE_PATH}..."
+rm -rf "${BASE_PATH}" || true
+mkdir -p "${BASE_PATH}/config"
+for SH in "${!SHARDS[@]}"; do
+    mkdir -p "${BASE_PATH}/${SH}"
+done
+
+Line by line:
+echo "📂 Creating directories under ${BASE_PATH}..."
+ → Prints a message to let you know what’s happening.
+
+
+rm -rf "${BASE_PATH}" || true
+ → Deletes the old cluster directory if it exists (rm -rf = force remove).
+ → || true ensures the script doesn’t fail if the folder isn’t there.
+
+
+mkdir -p "${BASE_PATH}/config"
+ → Creates the config server’s data directory. (-p = no error if already exists).
+
+
+The loop:
+for SH in "${!SHARDS[@]}"; do
+    mkdir -p "${BASE_PATH}/${SH}"
+done
+
+→ Iterates over shard names (shard1, shard2, shard3).
+ → Creates a data folder for each shard (e.g., /home/abhishek/mongodb_cluster/shard1).
+
+
+✅ At this point → all directories for config + shards are ready.
+
+
+
+7. Starting Config Server (Replica Set)
+
+echo "🔹 Starting config server (configReplSet) on ${IP}:${CONFIG_PORT}..."
+mongod --configsvr --replSet configReplSet --port "${CONFIG_PORT}" \
+      --dbpath "${BASE_PATH}/config" --bind_ip "${IP}" --fork \
+      --logpath "${BASE_PATH}/config/mongod.log"
+
+
+Line by line:
+echo "🔹 Starting config server ..."
+ → Prints status.
+
+
+mongod → starts a MongoDB server process.
+
+
+Options explained:
+
+
+--configsvr → runs this mongod as a config server.
+
+
+--replSet configReplSet → makes it part of a replica set named configReplSet.
+
+
+--port "${CONFIG_PORT}" → listen on port 27021.
+
+
+--dbpath "${BASE_PATH}/config" → store data files here.
+
+
+--bind_ip "${IP}" → restrict connections (here localhost only).
+
+
+--fork → run in background.
+
+
+--logpath "${BASE_PATH}/config/mongod.log" → save logs.
+
+
+✅ This command starts the config server process in the background.
+
+
+8. Initiating the Config Replica Set
+
+sleep 2
+echo "🔸 Initiating config server replica set..."
+mongosh --quiet --port "${CONFIG_PORT}" --eval "rs.initiate({_id:'configReplSet', configsvr:true, members:[{_id:0, host:'${IP}:${CONFIG_PORT}'}]});"
+
+sleep 2 → wait 2 seconds to ensure mongod is up.
+
+
+mongosh --quiet --port "${CONFIG_PORT}" → connect to the config server using mongosh.
+
+
+--eval "rs.initiate(...)" → run JavaScript inside mongosh:
+
+
+rs.initiate() → starts the replica set.
+
+
+_id:'configReplSet' → name of replica set.
+
+
+configsvr:true → mark it as a config server replica set.
+
+
+members:[{_id:0, host:'localhost:27021'}] → one-member replica set.
+
+
+
+
+9. Checking Config Server Status
+
+
+sleep 1
+echo "📈 config server rs.status():"
+mongosh --quiet --port "${CONFIG_PORT}" --eval "printjson(rs.status())"
+
+
+sleep 1 → small wait for initiation.
+
+
+Prints "📈 config server rs.status():" → just info text.
+
+
+Runs printjson(rs.status()) inside mongosh:
+
+
+Shows the replica set’s health, state, election info, etc.
+
+
+
+10. Start Shard Replica Sets (loop)
+
+for SH in "${!SHARDS[@]}";do
+	PORT=${SHARDS[$SH]}
+	echo "🔹 Starting shard ${SH} (replica set) on ${IP}:${PORT}..."
+	mongod --shardsvr --replSet "${SH}" --port "${PORT}" \
+		--dbpath "${BASE_PATH}/${SH}" --bind_ip "${IP}" --fork \
+		--logpath "${BASE_PATH}/${SH}/mongod.log"
+	sleep 2
+	echo "🔸 Initiating replica set for ${SH}..."
+	mongosh --quiet --port "${PORT}" --eval "rs.initiate({_id:'${SH}', members:[{_id:0, host:'${IP}:${PORT}'}]});"
+	sleep 1
+	echo "📈 ${SH} rs.status():"
+	mongosh --quiet --port "${PORT}" --eval "printjson(rs.status())"
+done
+
+
+Line by line:
+for SH in "${!SHARDS[@]}";do
+ → Loops through the keys in the SHARDS array (shard1, shard2, shard3).
+
+
+PORT=${SHARDS[$SH]}
+ → Looks up the port number for this shard.
+ Example: shard1=27018, shard2=27019, shard3=27020.
+
+
+Step 1: Start shard mongod process
+echo "🔹 Starting shard ${SH} (replica set) on ${IP}:${PORT}..."
+mongod --shardsvr --replSet "${SH}" --port "${PORT}" \
+	--dbpath "${BASE_PATH}/${SH}" --bind_ip "${IP}" --fork \
+	--logpath "${BASE_PATH}/${SH}/mongod.log"
+
+
+Prints a message: "Starting shard shard1...".
+
+
+mongod starts a MongoDB server instance.
+
+
+Options explained:
+
+
+--shardsvr → mark it as a shard server (different from config server).
+
+
+--replSet "${SH}" → starts a replica set, named after the shard (shard1, etc.).
+
+
+--port "${PORT}" → use assigned port (e.g., 27018).
+
+
+--dbpath "${BASE_PATH}/${SH}" → store data in its folder.
+
+
+--bind_ip "${IP}" → only accept connections from localhost.
+
+
+--fork → run in background.
+
+
+--logpath → save logs.
+
+
+✅ This creates a standalone replica set shard server.
+
+
+
+
+Step 2: Initiate Replica Set
+
+sleep 2
+echo "🔸 Initiating replica set for ${SH}..."
+mongosh --quiet --port "${PORT}" --eval "rs.initiate({_id:'${SH}', members:[{_id:0, host:'${IP}:${PORT}'}]});"
+
+sleep 2 → small wait before initiating.
+
+
+Prints "Initiating replica set for shard1".
+
+
+Connects with mongosh --port <PORT>.
+
+
+Runs:
+rs.initiate({
+  _id: 'shard1',
+  members: [
+    { _id: 0, host: 'localhost:27018' }
+  ]
+});
+
+This makes the shard a replica set (even if it only has 1 member).
+Later you can add more members for redundancy.
+
+
+Step 3: Check Replica Set Status
+
+sleep 1
+echo "📈 ${SH} rs.status():"
+mongosh --quiet --port "${PORT}" --eval "printjson(rs.status())"
+
+sleep 1 → wait a bit for replica set to be ready.
+
+
+Prints "📈 shard1 rs.status()".
+
+
+Runs rs.status() inside mongosh to check health & election info.
+
+✅ After this loop → all 3 shards (shard1, shard2, shard3) are up and initialized as replica sets.
+
+
+11. Start Mongos Router
+
+echo "🔹 Starting mongos router (configdb=configReplSet/${IP}:${CONFIG_PORT}) on port ${MONGOS_PORT}..."
+mongos --configdb configReplSet/"${IP}:${CONFIG_PORT}" --port "${MONGOS_PORT}" --bind_ip "${IP}" --fork --logpath "${BASE_PATH}/mongos.log"
+
+
+Prints: "Starting mongos router...".
+
+
+Starts a mongos process → this is the query router.
+
+
+Options explained:
+
+
+--configdb configReplSet/${IP}:${CONFIG_PORT} → tells mongos how to find the config server replica set.
+
+
+--port "${MONGOS_PORT}" → mongos listens on port 27017.
+
+
+--bind_ip "${IP}" → listen only on localhost.
+
+
+--fork → run in background.
+
+
+--logpath → save logs in mongos.log.
+
+
+✅ This is the entry point of the sharded cluster.
+ Applications always connect to mongos, never directly to shards.
+
+
+12. Add Shards to Cluster
+
+sleep 3 
+
+echo "🔸 Adding shards to cluster via mongos..."
+for SH in "${!SHARDS[@]}"; do
+	PORT=${SHARDS[$SH]}
+	echo "   -> Adding ${SH} at ${IP}:${PORT}"
+
+	# add as replica-set qualified shard name: shardName/host:port
+	mongosh --quiet --port "${MONGOS_PORT}" --eval "sh.addShard('${SH}/${IP}:${PORT}');"
+done
+
+
+sleep 3 → wait for mongos to be ready.
+
+
+Prints "Adding shards to cluster via mongos...".
+
+
+Loops over all shards.
+
+
+For each:
+Prints: "-> Adding shard1 at localhost:27018".
+
+
+Runs:
+sh.addShard("shard1/localhost:27018")
+
+This registers the shard with the cluster.
+
+
+✅ Now mongos knows about shard1, shard2, shard3 → cluster is complete.
+
+
+13. Final Setup Message
+
+echo "🎉 MongoDB Sharded Cluster setup complete!"
+echo "➡ Connect to mongos: mongosh --port ${MONGOS_PORT}"
+
+Prints a celebration message ✅.
+
+
+Tells you how to connect:
+
+mongosh --port 27017
+
+Since MONGOS_PORT=27017, that’s the entry point for clients.
+
+
+14. Show Cluster Status (sh.status)
+
+echo
+echo "----- mongos sh.status() -----"
+mongosh --quiet --port "${MONGOS_PORT}" --eval "sh.status();"
+
+
+Adds a line break (echo with nothing).
+
+
+Prints a heading: "----- mongos sh.status() -----".
+
+
+Runs inside mongos:
+sh.status()
+
+This shows:
+
+
+List of shards
+
+
+Databases
+
+
+Sharding/balancer info
+
+
+Config server connection
+
+
+Autosplit status
+
+
+✅ This is the main health check for the cluster.
+
+
+15. Tail Logs for Each Shard
+
+echo
+echo "----- Tail last 20 lines of each mongod log -----"
+for SH in "${!SHARDS[@]}"; do
+	PORT=${SHARDS[$SH]}
+	echo "---- ${SH} log (${BASE_PATH}/${SH}/mongod.log) ----"
+	tail -n 20 "${BASE_PATH}/${SH}/mongod.log" || true
+done
+
+
+Prints a heading.
+
+
+Loops through each shard (shard1, shard2, shard3).
+
+
+For each shard:
+
+
+Prints the log file location.
+
+
+Runs tail -n 20 → shows the last 20 lines of that shard’s log.
+
+
+|| true ensures the script doesn’t exit if tail fails.
+
+
+✅ This helps you quickly see if there were errors or warnings.
+
+
+16. Tail Config Server & Mongos Logs
+
+echo "--- ${SH} log (${BASE_PATH}/${SH}/mongod.log) ----"
+tail -n 20 "${BASE_PATH}/config/mongod.log" || true
+echo "--- mongos log (${BASE_PATH}/mongos.log) ----"
+tail -n 20 "${BASE_PATH}/mongos.log" || true
+
+Prints and tails Config Server logs.
+
+
+Prints and tails Mongos logs.
+
+
+✅ You get the latest info from every component:
+Shards (3)
+
+
+Config Server
+
+
+Mongos Router
+
+
+Summary of Script Flow
+Check tools → make sure mongod, mongos, mongosh are available.
+
+
+Create directories for config server + shards.
+
+
+Start Config Server + initiate replica set.
+
+
+Start Shards (3 replica sets) + initiate each.
+
+
+Start Mongos Router (entry point).
+
+
+Register Shards with the cluster via sh.addShard().
+
+
+Run checks (sh.status()) + tail logs for debugging
+
+
+✅ End result:
+A fully working MongoDB Sharded Cluster (1 config server, 3 shards, 1 mongos router) running locally with logs ready for inspection.
+
+
+
+
+
